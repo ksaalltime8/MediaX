@@ -1,9 +1,769 @@
-const {Client,GatewayIntentBits,REST,Routes,SlashCommandBuilder,EmbedBuilder,AttachmentBuilder}=require('discord.js');const config=require('../config');const Guild=require('../models/GuildConfig');const Job=require('../models/MediaJob');const {ALL,VIDEO,AUDIO,IMAGE,DOCUMENT,normalize}=require('../utils/formats');const {enqueueDownload}=require('../services/jobs');const {downloadStream}=require('../services/gridfs');
-const choices=ALL.map(v=>({name:v.toUpperCase(),value:v}));
-const commands=[new SlashCommandBuilder().setName('media').setDescription('MediaX controls').addSubcommand(x=>x.setName('formats').setDescription('Show supported formats')).addSubcommand(x=>x.setName('settings').setDescription('Show server settings')).addSubcommand(x=>x.setName('history').setDescription('Show your recent MediaX jobs')).addSubcommand(x=>x.setName('enable').setDescription('Enable MediaX')).addSubcommand(x=>x.setName('disable').setDescription('Disable MediaX')).addSubcommand(x=>x.setName('format').setDescription('Set default download format').addStringOption(o=>o.setName('value').setDescription('Format').setRequired(true).addChoices(...choices))),new SlashCommandBuilder().setName('media-download').setDescription('Download media').addStringOption(o=>o.setName('url').setDescription('HTTP/HTTPS media URL').setRequired(true)).addStringOption(o=>o.setName('format').setDescription('Output format').addChoices(...choices)),new SlashCommandBuilder().setName('media-convert').setDescription('Convert a Discord attachment').addAttachmentOption(o=>o.setName('file').setDescription('File to convert').setRequired(true)).addStringOption(o=>o.setName('format').setDescription('Output format').setRequired(true).addChoices(...choices))];
-async function cfg(id){return Guild.findOneAndUpdate({guildId:id},{$setOnInsert:{guildId:id}},{new:true,upsert:true})}
-function formatEmbed(){return new EmbedBuilder().setTitle('MediaX Formats').setDescription(`**Video:** ${VIDEO.join(', ')}\n**Audio:** ${AUDIO.join(', ')}\n**Images:** ${IMAGE.join(', ')}\n**Documents:** ${DOCUMENT.join(', ')}`)}
-async function start(){const c=new Client({intents:[GatewayIntentBits.Guilds]});c.once('ready',async()=>{console.log(`MediaX: ${c.user.tag} | ${c.guilds.cache.size} servers`);const rest=new REST({version:'10'}).setToken(config.discordToken);await rest.put(Routes.applicationCommands(config.discordClientId),{body:commands.map(x=>x.toJSON())});c.user.setActivity('MediaX • /media')});c.on('guildCreate',g=>cfg(g.id).catch(console.error));c.on('interactionCreate',async i=>{if(!i.isChatInputCommand())return;try{if(!i.guildId)return i.reply({content:'Use MediaX inside a server.',ephemeral:true});const settings=await cfg(i.guildId);if(i.commandName==='media'){const sub=i.options.getSubcommand();if(sub==='formats')return i.reply({embeds:[formatEmbed()]});if(sub==='settings')return i.reply(`Enabled: **${settings.enabled}**\nDefault format: **${settings.defaultFormat}**`);if(sub==='history'){const jobs=await Job.find({guildId:i.guildId,userId:i.user.id}).sort({createdAt:-1}).limit(10);return i.reply({content:jobs.length?jobs.map(j=>`\`${j.status}\` ${j.type} → **${j.outputFormat}** ${j.filename||''}`).join('\n'):'No jobs yet.',ephemeral:true})}if(!i.memberPermissions.has('ManageGuild'))return i.reply({content:'Manage Server permission required.',ephemeral:true});if(sub==='enable'||sub==='disable'){settings.enabled=sub==='enable';await settings.save();return i.reply(`MediaX is now **${settings.enabled?'enabled':'disabled'}**.`)}if(sub==='format'){settings.defaultFormat=normalize(i.options.getString('value',true));await settings.save();return i.reply(`Default format: **${settings.defaultFormat.toUpperCase()}**`)}}
-if(i.commandName==='media-download'){if(!settings.enabled)return i.reply({content:'MediaX is disabled here.',ephemeral:true});const url=i.options.getString('url',true);if(!/^https?:\/\//i.test(url))return i.reply({content:'Only HTTP/HTTPS URLs are supported.',ephemeral:true});const format=normalize(i.options.getString('format')||settings.defaultFormat);await i.deferReply();const job=await Job.create({guildId:i.guildId,userId:i.user.id,type:'download',source:url,outputFormat:format});enqueueDownload(job).then(async done=>{if(done.sizeBytes<=config.discordMaxFileMB*1048576){const stream=downloadStream(done.gridfsFileId);const chunks=[];for await(const ch of stream)chunks.push(ch);const att=new AttachmentBuilder(Buffer.concat(chunks),{name:done.filename});await i.editReply({content:`✅ **${done.filename}** ready.`,files:[att]})}else await i.editReply(`✅ Finished. The file is larger than the configured Discord attachment limit.\n${config.publicBaseUrl}/api/files/${done.gridfsFileId}`)}).catch(e=>i.editReply(`❌ ${e.message}`))}
-if(i.commandName==='media-convert'){if(!settings.enabled)return i.reply({content:'MediaX is disabled here.',ephemeral:true});const attachment=i.options.getAttachment('file',true);const outputFormat=normalize(i.options.getString('format',true));const inputFormat=normalize(require('path').extname(attachment.name));if(!inputFormat||inputFormat===outputFormat)return i.reply({content:'Choose a different output format.',ephemeral:true});if(!require('../utils/formats').canConvert(inputFormat,outputFormat))return i.reply({content:`Conversion from ${inputFormat} to ${outputFormat} is not supported.`,ephemeral:true});if(attachment.size>config.maxUploadMB*1048576)return i.reply({content:`That file exceeds the ${config.maxUploadMB} MB limit.`,ephemeral:true});await i.deferReply();const fs=require('fs');const tempPath=require('path').join(config.tempDir,`discord-${Date.now()}-${Math.random().toString(16).slice(2)}.${inputFormat}`);try{const response=await fetch(attachment.url);if(!response.ok)throw new Error(`Could not download the Discord attachment (${response.status})`);const file=fs.createWriteStream(tempPath);await new Promise((resolve,reject)=>{response.body.pipeTo(new WritableStream({write(chunk){return new Promise((r,j)=>file.write(Buffer.from(chunk),e=>e?j(e):r()))},close(){file.end(()=>resolve())},abort(e){file.destroy();reject(e)}})).catch(reject)});const job=await Job.create({guildId:i.guildId,userId:i.user.id,type:'convert',inputFormat,outputFormat});enqueueConvert(job,tempPath,inputFormat).then(async done=>{if(done.sizeBytes<=config.discordMaxFileMB*1048576){const stream=downloadStream(done.gridfsFileId);const chunks=[];for await(const ch of stream)chunks.push(ch);const att=new AttachmentBuilder(Buffer.concat(chunks),{name:done.filename});await i.editReply({content:`✅ **${done.filename}** ready.`,files:[att]})}else await i.editReply(`✅ Finished. ${config.publicBaseUrl}/api/files/${done.gridfsFileId}`)}).catch(e=>i.editReply(`❌ ${e.message}`))}catch(e){try{await fs.promises.rm(tempPath,{force:true})}catch{}await i.editReply(`❌ ${e.message}`)}}}
-catch(e){console.error(e);if(i.replied||i.deferred)i.followUp({content:e.message,ephemeral:true}).catch(()=>{});else i.reply({content:e.message,ephemeral:true}).catch(()=>{})}});await c.login(config.discordToken)}module.exports={start};
+const fs = require('fs');
+const path = require('path');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder,
+  AttachmentBuilder,
+  ActivityType,
+  MessageFlags
+} = require('discord.js');
+
+const config = require('../config');
+const Guild = require('../models/GuildConfig');
+const Job = require('../models/MediaJob');
+
+const {
+  ALL,
+  VIDEO,
+  AUDIO,
+  IMAGE,
+  DOCUMENT,
+  normalize,
+  canConvert
+} = require('../utils/formats');
+
+const {
+  enqueueDownload,
+  enqueueConvert
+} = require('../services/jobs');
+
+const {
+  downloadStream
+} = require('../services/gridfs');
+
+const choices = ALL.map(format => ({
+  name: format.toUpperCase(),
+  value: format
+}));
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('media')
+    .setDescription('MediaX controls')
+
+    .addSubcommand(sub =>
+      sub
+        .setName('formats')
+        .setDescription('Show supported formats')
+    )
+
+    .addSubcommand(sub =>
+      sub
+        .setName('settings')
+        .setDescription('Show server settings')
+    )
+
+    .addSubcommand(sub =>
+      sub
+        .setName('history')
+        .setDescription('Show your recent MediaX jobs')
+    )
+
+    .addSubcommand(sub =>
+      sub
+        .setName('enable')
+        .setDescription('Enable MediaX')
+    )
+
+    .addSubcommand(sub =>
+      sub
+        .setName('disable')
+        .setDescription('Disable MediaX')
+    )
+
+    .addSubcommand(sub =>
+      sub
+        .setName('format')
+        .setDescription('Set the default download format')
+        .addStringOption(option =>
+          option
+            .setName('value')
+            .setDescription('Format')
+            .setRequired(true)
+            .addChoices(...choices)
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName('media-download')
+    .setDescription('Download media from an HTTP/HTTPS URL')
+
+    .addStringOption(option =>
+      option
+        .setName('url')
+        .setDescription('Media URL')
+        .setRequired(true)
+    )
+
+    .addStringOption(option =>
+      option
+        .setName('format')
+        .setDescription('Output format')
+        .setRequired(false)
+        .addChoices(...choices)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('media-convert')
+    .setDescription('Convert a Discord attachment')
+
+    .addAttachmentOption(option =>
+      option
+        .setName('file')
+        .setDescription('File to convert')
+        .setRequired(true)
+    )
+
+    .addStringOption(option =>
+      option
+        .setName('format')
+        .setDescription('Output format')
+        .setRequired(true)
+        .addChoices(...choices)
+    )
+];
+
+async function getGuildConfig(guildId) {
+  return Guild.findOneAndUpdate(
+    { guildId },
+    {
+      $setOnInsert: {
+        guildId
+      }
+    },
+    {
+      new: true,
+      upsert: true,
+      setDefaultsOnInsert: true
+    }
+  );
+}
+
+function formatEmbed() {
+  return new EmbedBuilder()
+    .setTitle('MediaX Formats')
+    .setDescription(
+      [
+        `**Video:** ${VIDEO.join(', ')}`,
+        `**Audio:** ${AUDIO.join(', ')}`,
+        `**Images:** ${IMAGE.join(', ')}`,
+        `**Documents:** ${DOCUMENT.join(', ')}`
+      ].join('\n')
+    );
+}
+
+async function readGridFSFile(fileId) {
+  const chunks = [];
+  const stream = downloadStream(fileId);
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+async function sendCompletedJob(interaction, job) {
+  if (
+    !job ||
+    job.status !== 'completed' ||
+    !job.gridfsFileId
+  ) {
+    throw new Error(
+      'The MediaX job completed without producing a file.'
+    );
+  }
+
+  const maxDiscordBytes =
+    config.discordMaxFileMB * 1024 * 1024;
+
+  if (job.sizeBytes > maxDiscordBytes) {
+    return interaction.editReply({
+      content:
+        `✅ **${job.filename}** is ready, but it is too large for Discord's ` +
+        `${config.discordMaxFileMB} MB attachment limit.\n\n` +
+        `The file has been safely stored in MongoDB/GridFS.`
+    });
+  }
+
+  const buffer = await readGridFSFile(
+    job.gridfsFileId
+  );
+
+  const attachment = new AttachmentBuilder(
+    buffer,
+    {
+      name: job.filename
+    }
+  );
+
+  return interaction.editReply({
+    content:
+      `✅ **${job.filename}** is ready.`,
+    files: [attachment]
+  });
+}
+
+async function downloadDiscordAttachment(
+  attachment,
+  tempPath
+) {
+  const response = await fetch(
+    attachment.url,
+    {
+      signal: AbortSignal.timeout(120000)
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Could not download the Discord attachment (${response.status}).`
+    );
+  }
+
+  if (!response.body) {
+    throw new Error(
+      'Discord returned an empty attachment response.'
+    );
+  }
+
+  await fs.promises.mkdir(
+    path.dirname(tempPath),
+    {
+      recursive: true
+    }
+  );
+
+  await pipeline(
+    Readable.fromWeb(response.body),
+    fs.createWriteStream(tempPath)
+  );
+}
+
+function hasManageGuild(interaction) {
+  return Boolean(
+    interaction.memberPermissions?.has('ManageGuild')
+  );
+}
+
+async function start() {
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds
+    ]
+  });
+
+  client.once('ready', async () => {
+    console.log(
+      `MediaX online as ${client.user.tag}`
+    );
+
+    console.log(
+      `Connected to ${client.guilds.cache.size} server(s).`
+    );
+
+    client.user.setPresence({
+      activities: [
+        {
+          name: '/media',
+          type: ActivityType.Watching
+        }
+      ],
+      status: 'online'
+    });
+
+    try {
+      const rest = new REST({
+        version: '10'
+      }).setToken(
+        config.discordToken
+      );
+
+      await rest.put(
+        Routes.applicationCommands(
+          config.discordClientId
+        ),
+        {
+          body: commands.map(
+            command => command.toJSON()
+          )
+        }
+      );
+
+      console.log(
+        'MediaX slash commands registered globally.'
+      );
+    } catch (error) {
+      console.error(
+        'Could not register Discord slash commands:',
+        error
+      );
+    }
+  });
+
+  client.on('guildCreate', guild => {
+    getGuildConfig(guild.id)
+      .catch(error => {
+        console.error(
+          `Could not create config for guild ${guild.id}:`,
+          error
+        );
+      });
+  });
+
+  client.on(
+    'interactionCreate',
+    async interaction => {
+      if (!interaction.isChatInputCommand()) {
+        return;
+      }
+
+      try {
+        if (!interaction.guildId) {
+          return interaction.reply({
+            content:
+              'MediaX can only be used inside a Discord server.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        /*
+         * IMPORTANT:
+         *
+         * Discord requires an interaction to be acknowledged
+         * very quickly.
+         *
+         * MongoDB, yt-dlp and FFmpeg can all take longer than
+         * that, so we acknowledge FIRST and do the actual work
+         * AFTERWARD.
+         */
+
+        const subcommand =
+          interaction.commandName === 'media'
+            ? interaction.options.getSubcommand(false)
+            : null;
+
+        const privateResponse =
+          interaction.commandName === 'media-download' ||
+          interaction.commandName === 'media-convert' ||
+          (
+            interaction.commandName === 'media' &&
+            [
+              'settings',
+              'history',
+              'enable',
+              'disable',
+              'format'
+            ].includes(subcommand)
+          );
+
+        await interaction.deferReply(
+          privateResponse
+            ? {
+                flags:
+                  MessageFlags.Ephemeral
+              }
+            : undefined
+        );
+
+        /*
+         * MongoDB query happens AFTER deferReply().
+         */
+        const settings =
+          await getGuildConfig(
+            interaction.guildId
+          );
+
+        /*
+         * ==========================
+         * /media
+         * ==========================
+         */
+
+        if (
+          interaction.commandName === 'media'
+        ) {
+          if (subcommand === 'formats') {
+            return interaction.editReply({
+              embeds: [
+                formatEmbed()
+              ]
+            });
+          }
+
+          if (subcommand === 'settings') {
+            return interaction.editReply(
+              [
+                `Enabled: **${settings.enabled}**`,
+                `Default format: **${settings.defaultFormat.toUpperCase()}**`
+              ].join('\n')
+            );
+          }
+
+          if (subcommand === 'history') {
+            const jobs =
+              await Job.find({
+                guildId:
+                  interaction.guildId,
+                userId:
+                  interaction.user.id
+              })
+                .sort({
+                  createdAt: -1
+                })
+                .limit(10)
+                .lean();
+
+            const content =
+              jobs.length
+                ? jobs
+                    .map(job => {
+                      const filename =
+                        job.filename
+                          ? ` — ${job.filename}`
+                          : '';
+
+                      return (
+                        `\`${job.status}\` ` +
+                        `${job.type} → ` +
+                        `**${job.outputFormat.toUpperCase()}**` +
+                        filename
+                      );
+                    })
+                    .join('\n')
+                : 'No MediaX jobs yet.';
+
+            return interaction.editReply(
+              content
+            );
+          }
+
+          if (!hasManageGuild(interaction)) {
+            return interaction.editReply(
+              'Manage Server permission is required for this setting.'
+            );
+          }
+
+          if (
+            subcommand === 'enable' ||
+            subcommand === 'disable'
+          ) {
+            settings.enabled =
+              subcommand === 'enable';
+
+            await settings.save();
+
+            return interaction.editReply(
+              `MediaX is now **${
+                settings.enabled
+                  ? 'enabled'
+                  : 'disabled'
+              }**.`
+            );
+          }
+
+          if (subcommand === 'format') {
+            const format =
+              normalize(
+                interaction.options.getString(
+                  'value',
+                  true
+                )
+              );
+
+            if (!ALL.includes(format)) {
+              return interaction.editReply(
+                `Unsupported format: **${format}**`
+              );
+            }
+
+            settings.defaultFormat =
+              format;
+
+            await settings.save();
+
+            return interaction.editReply(
+              `Default download format is now **${format.toUpperCase()}**.`
+            );
+          }
+
+          return interaction.editReply(
+            'Unknown MediaX command.'
+          );
+        }
+
+        /*
+         * ==========================
+         * /media-download
+         * ==========================
+         */
+
+        if (
+          interaction.commandName ===
+          'media-download'
+        ) {
+          if (!settings.enabled) {
+            return interaction.editReply(
+              'MediaX is disabled in this server.'
+            );
+          }
+
+          const url =
+            interaction.options
+              .getString(
+                'url',
+                true
+              )
+              .trim();
+
+          try {
+            const parsed =
+              new URL(url);
+
+            if (
+              ![
+                'http:',
+                'https:'
+              ].includes(
+                parsed.protocol
+              )
+            ) {
+              throw new Error(
+                'Only HTTP/HTTPS URLs are supported.'
+              );
+            }
+          } catch {
+            return interaction.editReply(
+              'Please provide a valid HTTP/HTTPS URL.'
+            );
+          }
+
+          const format =
+            normalize(
+              interaction.options.getString(
+                'format'
+              ) ||
+                settings.defaultFormat
+            );
+
+          if (!ALL.includes(format)) {
+            return interaction.editReply(
+              `Unsupported format: **${format}**`
+            );
+          }
+
+          const job =
+            await Job.create({
+              guildId:
+                interaction.guildId,
+              userId:
+                interaction.user.id,
+              type: 'download',
+              source: url,
+              outputFormat:
+                format
+            });
+
+          const result =
+            await enqueueDownload(
+              job
+            );
+
+          return sendCompletedJob(
+            interaction,
+            result
+          );
+        }
+
+        /*
+         * ==========================
+         * /media-convert
+         * ==========================
+         */
+
+        if (
+          interaction.commandName ===
+          'media-convert'
+        ) {
+          if (!settings.enabled) {
+            return interaction.editReply(
+              'MediaX is disabled in this server.'
+            );
+          }
+
+          const attachment =
+            interaction.options.getAttachment(
+              'file',
+              true
+            );
+
+          const outputFormat =
+            normalize(
+              interaction.options.getString(
+                'format',
+                true
+              )
+            );
+
+          const inputFormat =
+            normalize(
+              path.extname(
+                attachment.name
+              )
+            );
+
+          if (!inputFormat) {
+            return interaction.editReply(
+              'The uploaded file does not have a recognizable extension.'
+            );
+          }
+
+          if (!ALL.includes(inputFormat)) {
+            return interaction.editReply(
+              `Input format **${inputFormat}** is not supported by MediaX.`
+            );
+          }
+
+          if (!ALL.includes(outputFormat)) {
+            return interaction.editReply(
+              `Output format **${outputFormat}** is not supported by MediaX.`
+            );
+          }
+
+          if (
+            inputFormat ===
+            outputFormat
+          ) {
+            return interaction.editReply(
+              'Choose a different output format.'
+            );
+          }
+
+          if (
+            !canConvert(
+              inputFormat,
+              outputFormat
+            )
+          ) {
+            return interaction.editReply(
+              `Conversion from **${inputFormat}** to **${outputFormat}** is not supported.`
+            );
+          }
+
+          const maxUploadBytes =
+            config.maxUploadMB *
+            1024 *
+            1024;
+
+          if (
+            attachment.size >
+            maxUploadBytes
+          ) {
+            return interaction.editReply(
+              `That file exceeds the ${config.maxUploadMB} MB upload limit.`
+            );
+          }
+
+          const tempPath =
+            path.join(
+              config.tempDir,
+              `discord-${Date.now()}-${interaction.user.id}-${Math.random()
+                .toString(16)
+                .slice(2)}.${inputFormat}`
+            );
+
+          try {
+            await downloadDiscordAttachment(
+              attachment,
+              tempPath
+            );
+
+            const job =
+              await Job.create({
+                guildId:
+                  interaction.guildId,
+                userId:
+                  interaction.user.id,
+                type: 'convert',
+                inputFormat,
+                outputFormat
+              });
+
+            const result =
+              await enqueueConvert(
+                job,
+                tempPath,
+                inputFormat
+              );
+
+            return sendCompletedJob(
+              interaction,
+              result
+            );
+          } finally {
+            try {
+              await fs.promises.rm(
+                tempPath,
+                {
+                  force: true
+                }
+              );
+            } catch {}
+          }
+        }
+
+        return interaction.editReply(
+          'Unknown MediaX command.'
+        );
+      } catch (error) {
+        console.error(
+          'MediaX interaction error:',
+          error
+        );
+
+        const message =
+          `❌ ${
+            error?.message ||
+            'An unexpected MediaX error occurred.'
+          }`;
+
+        try {
+          if (
+            interaction.deferred ||
+            interaction.replied
+          ) {
+            await interaction.editReply(
+              message
+            );
+          } else {
+            await interaction.reply({
+              content: message,
+              flags:
+                MessageFlags.Ephemeral
+            });
+          }
+        } catch (replyError) {
+          console.error(
+            'Could not send Discord error response:',
+            replyError
+          );
+        }
+      }
+    }
+  );
+
+  await client.login(
+    config.discordToken
+  );
+}
+
+module.exports = {
+  start
+};
