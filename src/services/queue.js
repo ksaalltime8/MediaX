@@ -1,0 +1,2 @@
+class Queue{constructor(limit){this.limit=limit;this.active=0;this.waiting=[]}add(task){return new Promise((resolve,reject)=>{this.waiting.push({task,resolve,reject});this.pump()})}pump(){while(this.active<this.limit&&this.waiting.length){const x=this.waiting.shift();this.active++;Promise.resolve().then(x.task).then(x.resolve,x.reject).finally(()=>{this.active--;this.pump()})}}}
+const {maxConcurrentJobs}=require('../config');module.exports=new Queue(maxConcurrentJobs);
