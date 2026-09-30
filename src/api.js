@@ -1,3 +1,0 @@
-const express=require('express'),helmet=require('helmet'),cors=require('cors');const config=require('./config');const apiKey=require('./middleware/apiKey');const routes=require('./routes/api');
-function startApi(){const app=express();app.disable('x-powered-by');app.use(helmet());app.use(cors());app.use(express.json({limit:'2mb'}));app.use('/api',apiKey,routes);app.use((err,req,res,next)=>{console.error(err);res.status(err.status||500).json({error:err.message||'Internal server error'})});const server=app.listen(config.apiPort,config.apiHost,()=>console.log(`API listening on ${config.apiHost}:${config.apiPort}`));return server}
-module.exports={startApi};
