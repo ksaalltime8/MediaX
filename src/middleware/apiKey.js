@@ -1,0 +1,1 @@
+const config=require('../config');module.exports=(req,res,next)=>{if(!config.apiKey)return next();const got=req.get('x-api-key')||req.get('authorization')?.replace(/^Bearer\s+/i,'');if(got!==config.apiKey)return res.status(401).json({error:'Unauthorized'});next()};
